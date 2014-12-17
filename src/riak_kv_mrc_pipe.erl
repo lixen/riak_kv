@@ -140,6 +140,7 @@
 -include_lib("riak_pipe/include/riak_pipe.hrl").
 -include_lib("riak_pipe/include/riak_pipe_log.hrl").
 -include("riak_kv_mrc_sink.hrl").
+-include("riak_kv_index.hrl").
 
 -export_type([map_query_fun/0,
               reduce_query_fun/0,
@@ -252,6 +253,16 @@ mapred_stream(Query, Options) when is_list(Options) ->
                     [{log, sink},{trace,[error]}]++Options),
      NumKeeps}.
 
+%% Build a stream that avoid the overhead of riak_kv_pipe_get.
+%% Also adds a nice debug option.
+mapred_stream_objects(Query, Options) when is_list(Options) ->
+    NumKeeps = count_keeps_in_query(Query),
+    TraceOpt = app_helper:get_env(riak_kv, pipe_log_level, [error]),
+    [_|Phases] = mr2pipe_phases(Query),
+    {riak_pipe:exec(Phases,
+                    [{log, sink},{trace,TraceOpt}]++Options),
+     NumKeeps}.
+
 %% @doc Setup the MapReduce plumbing, including separate process to
 %% receive output (the sink) and send input (the async sender), and a
 %% delayed `pipe_timeout' message. This call returns a context record
@@ -262,7 +273,17 @@ mapred_stream(Query, Options) when is_list(Options) ->
 %% context.
 -spec mapred_stream_sink(input(), [query_part()], timeout()) ->
          {ok, #mrc_ctx{}} | {error, term()}.
+mapred_stream_sink({index, _Bucket, <<"$bucket">>, _Start, _End} = Inputs, Query, Timeout) ->
+    case application:get_env(riak_kv, storage_backend) of
+        {ok, riak_cs_kv_multi_backend} ->
+            mapred_stream_sink_index(Inputs, Query, Timeout);
+        _ ->
+            mapred_stream_sink_1(Inputs, Query, Timeout)
+    end;
 mapred_stream_sink(Inputs, Query, Timeout) ->
+    mapred_stream_sink_1(Inputs, Query, Timeout).
+
+mapred_stream_sink_1(Inputs, Query, Timeout) ->
     {ok, Sink} = riak_kv_mrc_sink:start(self(), []),
     Options = [{sink, #fitting{pid=Sink}},
                {sink_type, {fsm, sink_sync_period(), infinity}}],
@@ -287,7 +308,35 @@ mapred_stream_sink(Inputs, Query, Timeout) ->
             _ = riak_kv_mrc_sink:stop(Sink),
             {error, {Fitting, Reason}}
     end.
-    
+
+
+mapred_stream_sink_index({index, _Bucket, <<"$bucket">>, _Start, _End} = Inputs,
+                         Query, Timeout) ->
+    %% Special optimization for CS
+    {ok, Sink} = riak_kv_mrc_sink:start(self(), []),
+    Options = [{sink, #fitting{pid=Sink}},
+               {sink_type, {fsm, sink_sync_period(), infinity}}],
+    try mapred_stream_objects(Query, Options) of
+        {{ok, Pipe}, NumKeeps} ->
+            %% catch just in case the pipe or sink has already died
+            %% for any reason - we'll get a DOWN from the monitor later
+            catch riak_kv_mrc_sink:use_pipe(Sink, Pipe),
+            SinkMon = erlang:monitor(process, Sink),
+            PipeRef = (Pipe#pipe.sink)#fitting.ref,
+            Timer = erlang:send_after(Timeout, self(),
+                                      {pipe_timeout, PipeRef}),
+            {Sender, SenderMon} = send_inputs_async_index(Pipe, Inputs, ?DEFAULT_TIMEOUT),
+            {ok, #mrc_ctx{ref=PipeRef,
+                          pipe=Pipe,
+                          sink={Sink,SinkMon},
+                          sender={Sender,SenderMon},
+                          timer={Timer,PipeRef},
+                          keeps=NumKeeps}}
+    catch throw:{badarg, Fitting, Reason} ->
+            _ = riak_kv_mrc_sink:stop(Sink),
+            {error, {Fitting, Reason}}
+    end.
+
 
 %% The plan functions are useful for seeing equivalent (we hope) pipeline.
 
@@ -398,6 +447,7 @@ map2pipe(FunSpec, Arg, Keep, I, QueryT) ->
                   _ ->
                       Arg
               end,
+
     [#fitting_spec{name={kvget_map,I},
                    module=riak_kv_pipe_get,
                    chashfun={riak_kv_pipe_get, bkey_chash},
@@ -555,6 +605,34 @@ send_inputs_async(Pipe, Inputs, Timeout) ->
               %% function, riak_kv_pb_socket and riak_kv_wm_mapred, want)
               erlang:link(Pipe#pipe.builder),
               case send_inputs(Pipe, Inputs, Timeout) of
+                  ok ->
+                      %% monitoring process sees a 'normal' exit
+                      %% (and linked builder is left alone)
+                      ok;
+                  Error ->
+                      %% monitoring process sees an 'error' exit
+                      %% (and linked builder dies)
+                      exit(Error)
+              end
+      end).
+
+%% copied from send_inputs_async/3 and send_inputs/3
+send_inputs_async_index(Pipe, Inputs, Timeout) ->
+    spawn_monitor(
+      fun() ->
+              erlang:link(Pipe#pipe.builder),
+              {index, Bucket, <<"$bucket">>, StartKey, EndKey} = Inputs,
+              %% _Query = {range, <<"$bucket">>, StartKey, EndKey},
+              true = riak_core_capability:get({riak_kv, mapred_2i_pipe}, false),
+              NewQuery = ?KV_INDEX_Q{filter_field= <<"$bucket">>,
+                                     start_term=StartKey,
+                                     start_inclusive=true,
+                                     end_term=EndKey,
+                                     end_inclusive=true,
+                                     start_key=StartKey,
+                                     return_body=true
+                                    },
+              case riak_kv_pipe_index:queue_existing_pipe(Pipe, Bucket, NewQuery, Timeout) of
                   ok ->
                       %% monitoring process sees a 'normal' exit
                       %% (and linked builder is left alone)
