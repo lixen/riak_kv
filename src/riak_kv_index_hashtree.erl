@@ -891,7 +891,18 @@ build_or_rehash(Self, Locked, Type, #state{index=Index, trees=Trees}) ->
     end.
 
 -spec maybe_rebuild(state()) -> state().
-maybe_rebuild(State=#state{lock=undefined, built=true, expired=true, index=Index}) ->
+maybe_rebuild(State=#state{lock=undefined, built=true, expired=true}) ->
+    case in_rebuild_window() of
+        true ->
+            rebuild(State);
+        _ ->
+            State
+    end;
+
+maybe_rebuild(State) ->
+    State.
+
+rebuild(State=#state{index=Index}) ->
     Self = self(),
     Pid = spawn_link(fun() ->
                              receive
@@ -910,9 +921,35 @@ maybe_rebuild(State=#state{lock=undefined, built=true, expired=true, index=Index
         _ ->
             Pid ! stop,
             State
-    end;
-maybe_rebuild(State) ->
-    State.
+    end.
+
+in_rebuild_window() ->
+    {_, {Hour, _, _}} = calendar:local_time(),
+    in_rebuild_window(Hour, rebuild_window()).
+
+in_rebuild_window(_NowHour, always) ->
+    true;
+in_rebuild_window(_NowHour, never) ->
+    false;
+in_rebuild_window(NowHour, {Start, End}) when Start =< End ->
+    (NowHour >= Start) and (NowHour =< End);
+in_rebuild_window(NowHour, {Start, End}) when Start > End ->
+    (NowHour >= Start) or (NowHour =< End).
+
+rebuild_window() ->
+    case application:get_env(riak_kv, aae_rebuild_window) of
+        {ok, always} ->
+            always;
+        {ok, never} ->
+            never;
+        {ok, {StartHour, EndHour}} when StartHour >= 0, StartHour =< 23,
+                                        EndHour >= 0, EndHour =< 23 ->
+            {StartHour, EndHour};
+        Other ->
+            error_logger:error_msg("Invalid aae_rebuild_window specified: ~p. "
+                                   "Defaulting to 'always'.\n", [Other]),
+            always
+    end.
 
 %% Check if the trees contain the magic index tree
 -spec has_index_tree(orddict()) -> boolean().
@@ -966,3 +1003,31 @@ maybe_get_vnode_lock(SrcPartition, Pid) ->
         false ->
             ok
     end.
+
+
+%% ====================================================================
+%% Unit tests
+%% ====================================================================
+
+-ifdef(EQC).
+
+prop_in_window() ->
+    ?FORALL({NowHour, WindowLen, StartTime}, {choose(0, 23), choose(0, 23), choose(0, 23)},
+            begin
+                EndTime = (StartTime + WindowLen) rem 24,
+
+                %% Generate a set of all hours within this window
+                WindowHours = [H rem 24 || H <- lists:seq(StartTime, StartTime + WindowLen)],
+
+                %% If NowHour is in the set of windows hours, we expect our function
+                %% to indicate that we are in the window
+                ExpInWindow = lists:member(NowHour, WindowHours),
+                ?assertEqual(ExpInWindow, in_rebuild_window(NowHour, {StartTime, EndTime})),
+                true
+            end).
+
+prop_in_window_test_() ->
+    {timeout, 30,
+     [fun() -> ?assert(eqc:quickcheck(prop_in_window())) end]}.
+
+-endif.

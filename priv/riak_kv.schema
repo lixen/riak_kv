@@ -102,6 +102,54 @@
   hidden
 ]}.
 
+
+%% allowed to be triggered. Valid options are:
+%%
+%% * `always` (default) No restrictions
+%% * `never` rebuild will never be attempted
+%% * `window` Hours during which merging is permitted, where
+%%   `anti_entropy.rebuild.window.start` and `anti_entropy.rebuild.window.end` are
+%%   integers between 0 and 23.
+%%
+%% If merging has a significant impact on performance of your cluster,
+%% or your cluster has quiet periods in which little storage activity
+%% occurs, you may want to change this setting from the default.
+{mapping, "anti_entropy.rebuild.policy", "riak_kv.aae_rebuild_window", [
+  {default, always},
+  {datatype, {enum, [always, never, window]}},
+  hidden
+]}.
+
+%% @see anti_entropy.rebuild.policy
+{mapping, "anti_entropy.rebuild.window.start", "riak_kv.aae_rebuild_window", [
+  {default, 0},
+  {datatype, integer},
+  hidden
+]}.
+
+%% @see anti_entropy.rebuild.policy
+{mapping, "anti_entropy.rebuild.window.end", "riak_kv.aae_rebuild_window", [
+  {default, 23},
+  {datatype, integer},
+  hidden
+]}.
+
+{translation,
+ "riak_kv.aae_rebuild_window",
+ fun(Conf) ->
+  Setting = cuttlefish:conf_get("anti_entropy.rebuild.policy", Conf),
+    case Setting of
+      always -> always;
+      never -> never;
+      window ->
+        Start = cuttlefish:conf_get("anti_entropy.rebuild.window.start", Conf, undefined),
+        End = cuttlefish:conf_get("anti_entropy.rebuild.window.end", Conf, undefined),
+        {Start, End};
+      _Default -> always
+    end
+ end}.
+
+
 %% @doc Limit how many AAE exchanges or builds can happen concurrently.
 {mapping, "anti_entropy.concurrency_limit", "riak_kv.anti_entropy_concurrency", [
   {default, 2},
