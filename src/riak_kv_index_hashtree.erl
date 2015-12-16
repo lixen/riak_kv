@@ -935,6 +935,7 @@ close_trees(State=#state{trees=Trees}) ->
     Trees3 = [{IdxN, hashtree:close(Tree)} || {IdxN, Tree} <- Trees2],
     State#state{trees=Trees3}.
 
+-spec get_all_locks(any(), index(), pid()) -> boolean().
 get_all_locks(Type, Index, Pid) ->
     case riak_kv_entropy_manager:get_lock(Type, Pid, Index) of
         ok ->
@@ -948,6 +949,7 @@ get_all_locks(Type, Index, Pid) ->
             false
     end.
 
+-spec maybe_get_vnode_lock(rehash|build, SrcPartition::index(), pid()) -> ok | max_concurrency.
 maybe_get_vnode_lock(rehash, _Partition, _Pid) ->
     %% rehash operations do not need a vnode lock
     ok;
