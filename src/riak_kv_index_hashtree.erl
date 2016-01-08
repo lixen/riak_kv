@@ -521,8 +521,6 @@ hash_index_data(IndexData) when is_list(IndexData) ->
     Bin = term_to_binary(lists:usort(IndexData)),
     riak_core_util:sha(Bin).
 
-
-
 %% Fold over a given vnode's data, inserting each object into the appropriate
 %% hashtree. Use the `if_missing' option to only insert the key/hash pair if
 %% the key does not already exist in the tree. This allows real-time updates
